@@ -1,0 +1,13 @@
+# Ignorar toda la carpeta de datos por seguridad
+data/
+
+# Ignorar el archivo específico de la imagen
+data/dashboard_proteccion_interior.csv
+
+# Ignorar cualquier archivo CSV o Excel dentro de la carpeta data
+data/*.csv
+data/*.xlsx
+data/*.xls
+
+# Ignorar archivos temporales que crea Excel al abrir documentos
+~$*.xlsx
