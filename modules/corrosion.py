@@ -359,7 +359,6 @@ def get_prophet(key, df_lado, periodos=3):
 # ═══════════════════════════════════════════════════════
 #  GRÁFICA PRINCIPAL — PLOTLY + PROPHET
 # ═══════════════════════════════════════════════════════
-
 matplotlib.use("Agg")
 
 # Estilo base oscuro via seaborn
@@ -389,7 +388,8 @@ def build_chart(
     """Genera figura Matplotlib/Seaborn para render.plot de Shiny."""
     color_main = "#00E676" if lado == "A" else "#FF4444"
 
-    fig, ax = plt.subplots(figsize=(9, 4), dpi=96)
+    plt.close("all")  # liberar figuras anteriores
+    fig, ax = plt.subplots(figsize=(9, 4), dpi=96, constrained_layout=True)
     fig.patch.set_facecolor("#131F13")
     ax.set_facecolor("#131F13")
 
@@ -512,7 +512,6 @@ def build_chart(
                   facecolor="#131F13", edgecolor="#1A3A1A",
                   labelcolor="#C8E6C9", framealpha=0.9)
 
-    fig.tight_layout(pad=0.8)
     return fig
 
 
@@ -542,7 +541,104 @@ CORROSION_HEAD_DEPS = [
 .selectize-dropdown-content::-webkit-scrollbar-track{background:#0D1A0D;}
 .selectize-dropdown-content::-webkit-scrollbar-thumb{background:#1A3A1A;border-radius:3px;}
 """),
-]
+
+    # ── CSS responsive para móvil + JS sidebar toggle ─────────────────────
+    ui.tags.style("""
+/* ─── Botón hamburguesa ─────────────────────────────────────────── */
+#sidebar-toggle-btn {
+    display: none;
+    position: fixed;
+    top: 10px; left: 10px;
+    z-index: 10000;
+    background: #0A1A0A;
+    border: 2px solid #00E676;
+    color: #00E676;
+    font-size: 20px;
+    width: 42px; height: 42px;
+    border-radius: 8px;
+    cursor: pointer;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 2px 12px rgba(0,0,0,.6);
+}
+#sidebar-overlay {
+    display: none;
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,.6);
+    z-index: 9998;
+}
+
+@media (max-width: 768px) {
+    #sidebar-toggle-btn { display: flex; }
+
+    /* CAUSA RAIZ: quitar overflow:hidden del padre */
+    #corrosion-layout {
+        overflow: visible !important;
+    }
+
+    /* Sidebar fijo, fuera de pantalla con transform */
+    #corrosion-sidebar {
+        position: fixed !important;
+        top: 0 !important; left: 0 !important;
+        transform: translateX(-110%) !important;
+        width: 260px !important; min-width: 260px !important;
+        height: 100dvh !important;
+        z-index: 9999 !important;
+        overflow-y: auto !important;
+        transition: transform 0.28s cubic-bezier(.4,0,.2,1) !important;
+        box-shadow: 4px 0 24px rgba(0,0,0,.85) !important;
+    }
+
+    #corrosion-sidebar.sb-open {
+        transform: translateX(0) !important;
+    }
+
+    #corrosion-main {
+        width: 100% !important;
+        overflow-y: auto !important;
+        -webkit-overflow-scrolling: touch !important;
+    }
+    #corrosion-kpi-grid {
+        grid-template-columns: repeat(2, 1fr) !important;
+        gap: 8px !important; padding: 10px !important;
+    }
+    #corrosion-charts-grid {
+        grid-template-columns: 1fr !important;
+        padding: 0 10px 20px !important;
+    }
+    #corrosion-header-info { display: none !important; }
+    .shiny-plot-output { height: 260px !important; }
+}
+"""),
+    ui.tags.script("""
+(function() {
+    var _open = false;
+    function S() { return document.getElementById('corrosion-sidebar'); }
+    function O() { return document.getElementById('sidebar-overlay'); }
+    function B() { return document.getElementById('sidebar-toggle-btn'); }
+
+    function openSB() {
+        var s=S(), o=O(), b=B(); if(!s) return;
+        _open=true;
+        s.classList.add('sb-open');
+        if(o){ o.style.display='block'; }
+        if(b) b.textContent='✕';
+    }
+    function closeSB() {
+        var s=S(), o=O(), b=B(); if(!s) return;
+        _open=false;
+        s.classList.remove('sb-open');
+        if(o) o.style.display='none';
+        if(b) b.textContent='☰';
+    }
+    document.addEventListener('click', function(e) {
+        var b=B(), o=O();
+        if(b && (e.target===b || b.contains(e.target))){ _open?closeSB():openSB(); return; }
+        if(o && e.target===o){ closeSB(); }
+    }, true);
+})();
+"""),]
 
 
 def corrosion_ui():
@@ -569,10 +665,16 @@ def corrosion_ui():
                     ui.span("*", style=f"color: {GREEN}; margin-right: 6px;"),
                     ui.span(
                         f"CSV - {_STATE['df']['sap_ddv_ducto'].nunique() if not _STATE['df'].empty else 0} DUCTOS - {len(_STATE['df']):,} REGISTROS - MONITOR ({POLL_SECONDS}s) - {prophet_status}"),
-                    style="display: flex; align-items: center;"
+                    id="corrosion-header-info", style="display: flex; align-items: center;"
                 ),
                 style=f"background: linear-gradient(90deg, #030A03 0%, #0A1A0A 60%, #030A03 100%); border-bottom: 2px solid {ACCENT}; padding: 14px 28px; display: flex; align-items: center; justify-content: space-between;"
             ),
+
+            # Botón hamburguesa (solo visible en móvil via CSS)
+            ui.tags.button("☰", id="sidebar-toggle-btn",
+                           title="Mostrar / ocultar filtros"),
+            # Overlay oscuro
+            ui.tags.div(id="sidebar-overlay"),
 
             # Main content
             ui.div(
@@ -629,22 +731,31 @@ def corrosion_ui():
                         ui.span("*" if PROPHET_OK else "!",
                                 style=f"color: {GREEN if PROPHET_OK else ORANGE}; margin-right: 6px; font-size: 12px;"),
                         ui.span(
-                            "Prediccion activa" if PROPHET_OK else "Instalar: pip install prophet",
+                            "Prediccion disponible" if PROPHET_OK else "Instalar: pip install prophet",
                             style=f"font-size: 10px; color: {GREEN if PROPHET_OK else ORANGE}; font-family: {FONT_MONO};"
                         ),
                         style="display: flex; align-items: center; margin-bottom: 6px;"
                     ),
                     ui.p(
-                        "Proyecta 3 mediciones futuras. Alerta temprana si prediccion > 2 mpy.",
-                        style=f"font-size: 9px; color: {TEXT_DIM}; font-family: {FONT_MONO}; line-height: 1.6; margin: 0;"
+                        "Proyecta 3 mediciones futuras. Alerta si prediccion > 2 mpy.",
+                        style=f"font-size: 9px; color: {TEXT_DIM}; font-family: {FONT_MONO}; line-height: 1.6; margin: 0 0 10px;"
                     ),
+                    ui.tags.button(
+                        "CALCULAR PROPHET",
+                        id="corrosion_prophet_btn",
+                        onclick="Shiny.setInputValue('corrosion_prophet_run', Math.random());",
+                        style=f"width: 100%; padding: 8px; background: transparent; border: 1px solid {GREEN2}; color: {GREEN2}; font-family: {FONT_MONO}; font-size: 10px; letter-spacing: 2px; border-radius: 5px; cursor: pointer; margin-bottom: 4px;"
+                        if PROPHET_OK else
+                        f"width: 100%; padding: 8px; background: transparent; border: 1px solid {BORDER}; color: {TEXT_DIM}; font-family: {FONT_MONO}; font-size: 10px; letter-spacing: 2px; border-radius: 5px; cursor: not-allowed; margin-bottom: 4px;"
+                    ),
+                    ui.output_ui("corrosion_prophet_status"),
 
                     ui.div(
                         style=f"border-top: 1px solid {BORDER}; margin: 18px 0;"),
                     section_title("INFO DEL DUCTO", ACCENT),
                     ui.output_ui("corrosion_info"),
 
-                    style=f"width: 230px; min-width: 230px; background: #0F1A0F; border-right: 2px solid {BORDER}; padding: 18px 15px; overflow-y: auto; height: calc(100vh - 62px);"
+                    id="corrosion-sidebar", style=f"width: 230px; min-width: 230px; background: #0F1A0F; border-right: 2px solid {BORDER}; padding: 18px 15px; overflow-y: auto; height: calc(100vh - 62px);"
                 ),
 
                 # Main content
@@ -656,7 +767,7 @@ def corrosion_ui():
                         kpi_card("~", "VEL PROM (mpy)", 3),
                         kpi_card("!", "> LIMITE",      4),
                         kpi_card("*", "CONDICION",     5),
-                        style="display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; padding: 16px 18px 12px;"
+                        id="corrosion-kpi-grid", style="display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; padding: 16px 18px 12px;"
                     ),
                     ui.output_ui("corrosion_banner"),
 
@@ -681,11 +792,11 @@ def corrosion_ui():
                                            height="380px"),
                             style=f"background: {BG_CARD}; border: 1px solid {BORDER}; border-top: 3px solid {B_MAIN}; border-radius: 10px; padding: 14px 16px;"
                         ),
-                        style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px; padding: 0 18px 20px;"
+                        id="corrosion-charts-grid", style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px; padding: 0 18px 20px;"
                     ),
-                    style=f"flex: 1; overflow-y: auto; background: {BG_DARK};"
+                    id="corrosion-main", style=f"flex: 1; overflow-y: auto; background: {BG_DARK};"
                 ),
-                style="display: flex; height: calc(100vh - 62px); overflow: hidden;"
+                id="corrosion-layout", style="display: flex; height: calc(100vh - 62px); overflow: hidden;"
             ),
             style="background: #0A1A0A; min-height: 100vh;"
         ),
@@ -973,24 +1084,87 @@ def corrosion_server(input, output, session):
         key = (data["ducto"], lado, data.get("year_from"), data.get("year_to"))
         return get_prophet(key, dff.copy(), periodos=3)
 
+    # Flag reactivo: True solo cuando el usuario presionó "CALCULAR PROPHET"
+    # Se resetea al cambiar ducto/filtros para evitar calcular con datos viejos
+    _prophet_requested = reactive.Value(False)
+
+    @reactive.Effect
+    @reactive.event(input.corrosion_apply, input.corrosion_clear)
+    def _reset_prophet_flag():
+        _prophet_requested.set(False)
+        # Limpiar cache prophet de la selección anterior
+        data = selected_data.get()
+        if data.get("ducto"):
+            for lado in ("A", "B"):
+                k = (data["ducto"], lado, data.get(
+                    "year_from"), data.get("year_to"))
+                _prophet_cache.pop(k, None)
+                _prophet_locks.pop(k, None)
+
+    @reactive.Effect
+    @reactive.event(input.corrosion_prophet_run)
+    def _handle_prophet_run():
+        _prophet_requested.set(True)
+
+    @output
+    @render.ui
+    def corrosion_prophet_status():
+        """Estado de Prophet debajo del botón."""
+        if not _prophet_requested.get():
+            return ui.span(
+                "Sin predicción activa",
+                style=f"font-size: 9px; color: {TEXT_DIM}; font-family: {FONT_MONO};"
+            )
+        data = selected_data.get()
+        if not data.get("applied") or not data.get("ducto"):
+            return ui.span("")
+        parts = []
+        for lado in ("A", "B"):
+            k = (data["ducto"], lado, data.get(
+                "year_from"), data.get("year_to"))
+            if k in _prophet_cache:
+                _, _, st = _prophet_cache[k]
+                parts.append(f"L{lado}: {st}" if st else f"L{lado}: OK")
+            elif k in _prophet_locks:
+                parts.append(f"L{lado}: calculando...")
+            else:
+                parts.append(f"L{lado}: pendiente")
+        done = all("OK" in p or "ok" in p.lower() for p in parts)
+        return ui.span(
+            " | ".join(parts),
+            style=f"font-size: 9px; color: {GREEN if done else ORANGE}; font-family: {FONT_MONO};"
+        )
+
+    def _make_graph(lado: str):
+        """Genera figura para el lado indicado. Sin cache de figura — siempre fresca."""
+        data = selected_data.get()
+        if not data.get("applied") or not data.get("ducto"):
+            return None
+        dff = _get_dff(data, lado)
+        if dff.empty:
+            return None
+        fc, alerta, status = (None, False, "")
+        if _prophet_requested.get() and PROPHET_OK:
+            fc, alerta, status = _get_prophet_result(dff, data, lado)
+        # Crear figura fresca — plt.close se llama dentro de build_chart (no)
+        # Shiny llama savefig() y cierra por su cuenta; build_chart retorna Figure limpia
+        fig = build_chart(dff, lado,
+                          forecast=fc, alerta_prophet=alerta, prophet_status=status)
+        return fig
+
     @output
     @render.plot
     def corrosion_graph_a():
-        # selected_data es reactivo: re-ejecuta automáticamente cuando cambia
-        _ = input.corrosion_interval()   # suscribirse al tick del intervalo
-        data = selected_data.get()
-        dff = _get_dff(data, "A")
-        fc, alerta, status = _get_prophet_result(dff, data, "A")
-        return build_chart(dff, "A", forecast=fc, alerta_prophet=alerta, prophet_status=status)
+        # Reactividad natural: re-ejecuta cuando selected_data o _prophet_requested cambian.
+        # El interval tick también provoca re-render para recoger Prophet cuando termina.
+        input.corrosion_interval()
+        return _make_graph("A")
 
     @output
     @render.plot
     def corrosion_graph_b():
-        _ = input.corrosion_interval()
-        data = selected_data.get()
-        dff = _get_dff(data, "B")
-        fc, alerta, status = _get_prophet_result(dff, data, "B")
-        return build_chart(dff, "B", forecast=fc, alerta_prophet=alerta, prophet_status=status)
+        input.corrosion_interval()
+        return _make_graph("B")
 
 
 # ═══════════════════════════════════════════════════════
@@ -1006,6 +1180,53 @@ if not _STATE["df"].empty:
         f"  [Monitor] Thread lanzado (daemon) — PID monitor: {_t_monitor.ident}", flush=True)
 else:
     print("  [Monitor] DataFrame vacío — monitor NO iniciado", flush=True)
+
+# ═══════════════════════════════════════════════════════
+#  LINKS DE ACCESO — se imprimen al arrancar el módulo
+# ═══════════════════════════════════════════════════════
+
+
+def _print_access_links(port: int = 8000):
+    import socket
+
+    def _get_all_ips():
+        ips = []
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None):
+                ip = info[4][0]
+                if ":" not in ip and not ip.startswith("127.") and ip not in ips:
+                    ips.append(ip)
+        except Exception:
+            pass
+        return ips
+
+    all_ips = _get_all_ips()
+
+    def _ip_priority(ip):
+        if ip.startswith("192.168."):
+            return 0   # WiFi doméstica — primero
+        if ip.startswith("10."):
+            return 1   # LAN corporativa
+        if ip.startswith("172.16.") or ip.startswith("172.17."):
+            return 9  # virtuales — al fondo
+        return 5
+
+    all_ips.sort(key=_ip_priority)
+
+    def pad(url): return url.ljust(38)
+    print("", flush=True)
+    print("  ╔══════════════════════════════════════════════════╗", flush=True)
+    print("  ║        PEMEX — SISTEMA INTEGRAL                 ║", flush=True)
+    print("  ╠══════════════════════════════════════════════════╣", flush=True)
+    print(f"  ║  Local :  {pad(f'http://127.0.0.1:{port}')}  ║", flush=True)
+    for ip in all_ips:
+        tag = "WiFi  " if ip.startswith("192.168.") else "Red   "
+        print(f"  ║  {tag}:  {pad(f'http://{ip}:{port}')}  ║", flush=True)
+    print("  ╚══════════════════════════════════════════════════╝", flush=True)
+    print("", flush=True)
+
+
+_print_access_links(port=8000)
 
 # ═══════════════════════════════════════════════════════
 #  PARA EJECUCIÓN INDEPENDIENTE
