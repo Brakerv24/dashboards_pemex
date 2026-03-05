@@ -1,9 +1,9 @@
 """Módulo de Dashboard de Corrosión - PEMEX con Prophet"""
 
-import seaborn as sns
-import matplotlib.dates as mdates
-import matplotlib.pyplot as plt
-import matplotlib
+# ── Plotly (sin matplotlib ni seaborn) ───────────────────────────────────────
+import plotly.graph_objects as go
+import plotly.io as pio
+
 import logging
 import os
 import sys
@@ -37,7 +37,7 @@ except ImportError:
     except ImportError:
         PROPHET_OK = False
 
-# Suprimir logs de Prophet/cmdstanpy al importar
+# Suprimir logs de Prophet/cmdstanpy
 logging.getLogger("prophet").setLevel(logging.ERROR)
 logging.getLogger("cmdstanpy").setLevel(logging.ERROR)
 
@@ -48,7 +48,6 @@ LIMITE_CORR = 2.0
 POLL_SECONDS = 15
 N8N_WEBHOOK = "http://localhost:5678/webhook-test/e21f45ac-7f00-4e9e-b481-dd6fcc93af7a"
 
-# Colores exclusivos para los puntos Prophet
 PROPHET_SAFE_COLOR = "#00BFFF"   # Azul cian — predicción dentro del límite
 PROPHET_ALERT_COLOR = "#FF6D00"   # Naranja intenso — predicción supera el límite
 
@@ -92,24 +91,20 @@ def load_data():
     return df.sort_values("fecha_retiro").reset_index(drop=True)
 
 
-# Contenedor mutable — permite que todos los módulos vean actualizaciones
 _STATE = {"df": load_data()}
 _LAST_MTIME = os.path.getmtime(
     get_data_path()) if os.path.exists(get_data_path()) else 0
 _alertas_emitidas = set()
 
-# Alias de conveniencia (leer siempre via _STATE["df"])
-
 
 def DF():
     return _STATE["df"]
+
 
 # ═══════════════════════════════════════════════════════
 #  MONITOR Y ALERTAS N8N
 # ═══════════════════════════════════════════════════════
 
-
-# Historial de envíos visible en la UI (máx 30 entradas)
 _n8n_log: list = []
 _N8N_LOG_MAX = 30
 
@@ -130,7 +125,6 @@ _alertas_emitidas = _inicializar_alertas(_STATE["df"])
 
 
 def _log_n8n(msg: str, ok: bool = True):
-    """Agrega una entrada al log visible en UI."""
     global _n8n_log
     ts = datetime.now().strftime("%H:%M:%S")
     _n8n_log.append({"ts": ts, "msg": msg, "ok": ok})
@@ -206,7 +200,6 @@ def _monitor_archivo():
                         f"  [Monitor] >>> EXCEDENTE {row.get('n_ducto', '?')} | {vel:.4f} mpy > {LIMITE_CORR} mpy — enviando a N8N...", flush=True)
                     _enviar_alerta_n8n(row, tipo="REAL")
             _STATE["df"] = df_nuevo
-            # Limpiar cache Prophet — datos nuevos
             _prophet_cache.clear()
             _prophet_locks.clear()
             print(
@@ -215,21 +208,11 @@ def _monitor_archivo():
             print(f"  [Monitor] ERROR ciclo {ciclo}: {e}", flush=True)
 
 
-def _prophet_forecast(df_lado, periodos: int = 3):
-    """
-    Ajusta Prophet sobre los datos históricos del lado y devuelve exactamente
-    `periodos` puntos de predicción futuros.
+# ═══════════════════════════════════════════════════════
+#  PROPHET
+# ═══════════════════════════════════════════════════════
 
-    Retorna
-    -------
-    forecast_df : pd.DataFrame o None
-        Columnas: ds, yhat, yhat_lower, yhat_upper
-        Siempre tiene exactamente `periodos` filas si el ajuste fue exitoso.
-    alerta_bool : bool
-        True si alguno de los puntos predichos supera LIMITE_CORR.
-    status_msg  : str
-        Mensaje de estado/diagnóstico para mostrar en la UI.
-    """
+def _prophet_forecast(df_lado, periodos: int = 3):
     if not PROPHET_OK:
         return None, False, "Prophet no instalado  →  pip install prophet"
 
@@ -241,31 +224,22 @@ def _prophet_forecast(df_lado, periodos: int = 3):
         return None, False, f"Pocos datos ({n_total} pts, mínimo 3)"
 
     try:
-        # ── 1. Preparar serie temporal ──────────────────────────────────────
         df_p = (
             df_lado[["fecha_retiro", "velocidad_de_corrosion_mpy"]]
             .rename(columns={"fecha_retiro": "ds", "velocidad_de_corrosion_mpy": "y"})
             .dropna()
             .sort_values("ds")
         )
-        # Colapsar duplicados de fecha tomando la media
         df_p = df_p.groupby("ds", as_index=False)["y"].mean()
 
         n_puntos = len(df_p)
         rango_dias = (df_p["ds"].max() - df_p["ds"].min()).days
 
-        print(
-            f"  [Prophet] {n_puntos} puntos únicos | rango {rango_dias} días", flush=True)
-
         if n_puntos < 3:
             return None, False, f"Pocos puntos únicos ({n_puntos})"
-
-        # Si todos los valores son idénticos, Prophet no aprende nada útil
         if df_p["y"].std() == 0:
             return None, False, "Serie constante — sin variabilidad para modelar"
 
-        # ── 2. Configurar modelo según densidad de datos ────────────────────
-        # uncertainty_samples bajo (50) para respuesta rápida en UI
         yearly_seasonality = rango_dias >= 365
         cp_scale = 0.5 if rango_dias < 365 else 0.3
 
@@ -275,30 +249,23 @@ def _prophet_forecast(df_lado, periodos: int = 3):
             daily_seasonality=False,
             interval_width=0.80,
             changepoint_prior_scale=cp_scale,
-            uncertainty_samples=50,   # ← reducido para velocidad en Shiny
+            uncertainty_samples=50,
         )
 
-        print(f"  [Prophet] Ajustando modelo...", flush=True)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             model.fit(df_p)
-        print(f"  [Prophet] Modelo ajustado OK", flush=True)
 
-        # ── 3. Calcular la frecuencia típica de muestreo ────────────────────
         diffs = df_p["ds"].diff().dropna()
         freq_dias = max(int(diffs.median().days),
                         30) if len(diffs) > 0 else 180
 
-        # ── 4. Generar exactamente `periodos` fechas futuras ────────────────
         ultima_fecha = df_p["ds"].max()
         fechas_futuras = [
-            ultima_fecha + timedelta(days=freq_dias * i)
-            for i in range(1, periodos + 1)
-        ]
+            ultima_fecha + timedelta(days=freq_dias * i) for i in range(1, periodos + 1)]
         future = pd.DataFrame({"ds": fechas_futuras})
         forecast = model.predict(future)
 
-        # Clamp a cero (la corrosión no puede ser negativa)
         for col in ("yhat", "yhat_lower", "yhat_upper"):
             forecast[col] = forecast[col].clip(lower=0.0)
 
@@ -308,9 +275,6 @@ def _prophet_forecast(df_lado, periodos: int = 3):
             f"Δ~{freq_dias}d  |  {'⚠ ALERTA' if alerta else '✓ OK'}"
         )
         print(f"  [Prophet] {status}", flush=True)
-        print(
-            f"  [Prophet] Predicciones: {forecast[['ds', 'yhat']].to_dict('records')}", flush=True)
-
         return forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]], alerta, status
 
     except Exception as exc:
@@ -321,29 +285,19 @@ def _prophet_forecast(df_lado, periodos: int = 3):
         return None, False, msg
 
 
-# ── Cache de predicciones Prophet ────────────────────────────────────────────
-# Clave: (sap_ddv_ducto, lado, year_from, year_to) → (forecast_df, alerta, status)
-# Calculado en thread separado para no bloquear el event loop de Shiny.
 _prophet_cache: dict = {}
-_prophet_locks: dict = {}   # un lock por clave para evitar doble-cómputo
+_prophet_locks: dict = {}
 
 
 def _prophet_forecast_async(key, df_lado, periodos=3):
-    """Corre _prophet_forecast en background y guarda resultado en cache."""
     result = _prophet_forecast(df_lado, periodos)
     _prophet_cache[key] = result
-    # Liberar lock
     if key in _prophet_locks:
         del _prophet_locks[key]
     print(f"  [Prophet-cache] key={key[1]} guardado", flush=True)
 
 
 def get_prophet(key, df_lado, periodos=3):
-    """
-    Devuelve (forecast, alerta, status) desde cache si existe.
-    Si no, lanza el cómputo en background y retorna placeholder.
-    El próximo render (interval tick) tendrá el resultado listo.
-    """
     if key in _prophet_cache:
         return _prophet_cache[key]
     if key not in _prophet_locks:
@@ -357,25 +311,14 @@ def get_prophet(key, df_lado, periodos=3):
 
 
 # ═══════════════════════════════════════════════════════
-#  GRÁFICA PRINCIPAL — PLOTLY + PROPHET
+#  GRÁFICA PRINCIPAL — PLOTLY
 # ═══════════════════════════════════════════════════════
-matplotlib.use("Agg")
 
-# Estilo base oscuro via seaborn
-sns.set_theme(style="darkgrid", rc={
-    "figure.facecolor":  "#131F13",
-    "axes.facecolor":    "#0F1A0F",
-    "axes.edgecolor":    "#1A3A1A",
-    "axes.labelcolor":   "#90A4AE",
-    "text.color":        "#C8E6C9",
-    "xtick.color":       "#90A4AE",
-    "ytick.color":       "#90A4AE",
-    "grid.color":        "#1A3A1A",
-    "grid.alpha":        0.6,
-    "font.family":       "monospace",
-    "axes.spines.top":   False,
-    "axes.spines.right": False,
-})
+# Colores hex → rgba helper
+def _hex_rgba(hex_color: str, alpha: float) -> str:
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
 
 
 def build_chart(
@@ -384,24 +327,64 @@ def build_chart(
     forecast=None,
     alerta_prophet: bool = False,
     prophet_status: str = "",
-) -> plt.Figure:
-    """Genera figura Matplotlib/Seaborn para render.plot de Shiny."""
-    color_main = "#00E676" if lado == "A" else "#FF4444"
+    uirevision_key: str = "",
+) -> go.Figure:
+    """Genera figura Plotly para render.ui de Shiny."""
+    color_main = A_MAIN if lado == "A" else B_MAIN
 
-    plt.close("all")  # liberar figuras anteriores
-    fig, ax = plt.subplots(figsize=(9, 4), dpi=96, constrained_layout=True)
-    fig.patch.set_facecolor("#131F13")
-    ax.set_facecolor("#131F13")
+    # ── Fondo / layout base ──────────────────────────────────────────────────
+    layout = go.Layout(
+        # uirevision estable → Plotly preserva zoom/pan entre re-renders.
+        # Solo cambia cuando el ducto o filtros cambian (datos nuevos).
+        uirevision=uirevision_key or f"{lado}-default",
+        paper_bgcolor="#131F13",
+        plot_bgcolor="#131F13",
+        font=dict(family="DM Mono, monospace", color="#C8E6C9", size=11),
+        margin=dict(l=54, r=24, t=54, b=54),
+        height=380,
+        title=dict(
+            text=f"LADO {lado} — Velocidad de Corrosión vs Tiempo",
+            font=dict(color=color_main, size=11),
+            x=0.01, xanchor="left",
+        ),
+        xaxis=dict(
+            title=dict(text="Fecha de retiro", font=dict(size=9)),
+            tickfont=dict(size=9),
+            gridcolor="#1A3A1A",
+            linecolor="#1A3A1A",
+            tickformat="%Y-%m",
+            showgrid=True,
+        ),
+        yaxis=dict(
+            title=dict(text="mpy", font=dict(size=9)),
+            tickfont=dict(size=9),
+            gridcolor="#1A3A1A",
+            linecolor="#1A3A1A",
+            rangemode="tozero",
+            showgrid=True,
+        ),
+        legend=dict(
+            bgcolor="#131F13",
+            bordercolor="#1A3A1A",
+            borderwidth=1,
+            font=dict(size=8),
+            orientation="h",
+            yanchor="bottom", y=1.01,
+            xanchor="left",   x=0,
+        ),
+        hovermode="x unified",
+    )
+
+    fig = go.Figure(layout=layout)
 
     # ── Sin datos ────────────────────────────────────────────────────────────
     if df_lado.empty:
-        ax.text(0.5, 0.5, f"Sin datos — Lado {lado}",
-                ha="center", va="center", transform=ax.transAxes,
-                color="#546E7A", fontsize=12)
-        for sp in ax.spines.values():
-            sp.set_visible(False)
-        ax.set_xticks([])
-        ax.set_yticks([])
+        fig.add_annotation(
+            text=f"Sin datos — Lado {lado}",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(color="#546E7A", size=12),
+        )
         return fig
 
     df_lado = df_lado.sort_values("fecha_retiro").copy()
@@ -413,110 +396,194 @@ def build_chart(
     y_max = max(vel.max() * 1.30, 2.8)
     if forecast is not None and not forecast.empty:
         y_max = max(y_max, forecast["yhat_upper"].max() * 1.15)
+    fig.update_yaxes(range=[0, y_max])
 
-    # ── Zona de peligro ───────────────────────────────────────────────────────
-    ax.axhspan(LIMITE_CORR, y_max, alpha=0.05, color="#FF4444", zorder=0)
+    # ── Zona de peligro (hrect) ───────────────────────────────────────────────
+    fig.add_hrect(
+        y0=LIMITE_CORR, y1=y_max,
+        fillcolor="rgba(255,68,68,0.05)",
+        line_width=0,
+        layer="below",
+    )
 
     # ── Barras históricas ─────────────────────────────────────────────────────
     bar_colors = ["#FF4444" if v > LIMITE_CORR else color_main for v in vel]
-    ax.bar(fechas, vel, color=bar_colors, alpha=0.82,
-           width=18, label="Mediciones", zorder=3)
+    # Ancho dinámico: 90% del intervalo mediano entre mediciones (en ms)
+    if len(fechas) >= 2:
+        diffs_ms = fechas.sort_values().diff().dropna().dt.total_seconds() * 1000
+        bar_width = max(int(diffs_ms.median() * 0.90), 30 *
+                        24 * 3600 * 1000)  # mínimo 30 días
+    else:
+        bar_width = 90 * 24 * 3600 * 1000  # fallback 90 días
+    fig.add_trace(go.Bar(
+        x=fechas,
+        y=vel,
+        marker=dict(color=bar_colors, opacity=0.85),
+        width=bar_width,
+        name="Mediciones",
+        hovertemplate="%{x|%Y-%m-%d}<br>%{y:.4f} mpy<extra></extra>",
+    ))
 
     # ── Tendencia rolling ─────────────────────────────────────────────────────
     if len(df_lado) >= 3:
         w = max(2, min(5, len(df_lado) // 5))
         tend = vel.rolling(window=w, min_periods=1).mean()
-        ax.plot(fechas, tend, color="#FFD600", linewidth=1.8,
-                linestyle="--", label="Tendencia", zorder=4)
+        fig.add_trace(go.Scatter(
+            x=fechas, y=tend,
+            mode="lines",
+            line=dict(color="#FFD600", width=1.8, dash="dash"),
+            name="Tendencia",
+            hovertemplate="%{x|%Y-%m-%d}<br>%{y:.4f} mpy<extra>Tendencia</extra>",
+        ))
 
     # ── Límite normativo ──────────────────────────────────────────────────────
-    ax.axhline(LIMITE_CORR, color="#FF1744", linewidth=1.8,
-               linestyle="--", label=f"Límite {LIMITE_CORR} mpy", zorder=5)
+    fig.add_hline(
+        y=LIMITE_CORR,
+        line=dict(color="#FF1744", width=1.8, dash="dash"),
+        annotation_text=f"Límite {LIMITE_CORR} mpy",
+        annotation_position="top right",
+        annotation_font=dict(color="#FF1744", size=9),
+    )
 
     # ── Separador HOY ─────────────────────────────────────────────────────────
-    ax.axvline(ultima, color="#546E7A", linewidth=1,
-               linestyle=":", alpha=0.7, zorder=1)
-    ax.text(ultima, y_max * 0.97, "  HOY", color="#546E7A",
-            fontsize=7, ha="left", va="top")
+    # add_vline tiene un bug interno con ejes de fecha (int+str).
+    # Usamos add_shape + add_annotation por separado para evitarlo.
+    # milisegundos epoch que Plotly usa internamente
+    ultima_ms = int(ultima.timestamp() * 1000)
+    fig.add_shape(
+        type="line",
+        x0=ultima_ms, x1=ultima_ms,
+        y0=0, y1=1,
+        xref="x", yref="paper",
+        line=dict(color="#546E7A", width=1, dash="dot"),
+        opacity=0.7,
+    )
+    fig.add_annotation(
+        x=ultima_ms, y=1,
+        xref="x", yref="paper",
+        text="HOY",
+        showarrow=False,
+        xanchor="left",
+        font=dict(color="#546E7A", size=8),
+    )
 
     # ── Prophet ───────────────────────────────────────────────────────────────
     if forecast is not None and not forecast.empty:
         pred_color = "#FF6D00" if alerta_prophet else "#00BFFF"
 
-        # Banda de incertidumbre
-        ax.fill_between(forecast["ds"],
-                        forecast["yhat_lower"], forecast["yhat_upper"],
-                        alpha=0.15, color=pred_color, zorder=2,
-                        label="Banda Prophet (80%)")
+        # Convertir fechas Prophet a string ISO (Plotly no acepta pd.Timestamp en traces mixtos)
+        fc_ds = [d.isoformat() for d in forecast["ds"]]
 
-        # Línea puente
-        bx = [ultima] + list(forecast["ds"])
-        by = [vel.iloc[-1]] + list(forecast["yhat"])
-        ax.plot(bx, by, color=pred_color, linewidth=1.6,
-                linestyle="--", alpha=0.75, zorder=6)
+        # Banda de incertidumbre (fill entre upper e lower)
+        fig.add_trace(go.Scatter(
+            x=fc_ds + list(reversed(fc_ds)),
+            y=list(forecast["yhat_upper"]) +
+            list(reversed(list(forecast["yhat_lower"]))),
+            fill="toself",
+            fillcolor=_hex_rgba(pred_color, 0.15),
+            line=dict(width=0),
+            name="Banda Prophet (80%)",
+            hoverinfo="skip",
+            showlegend=True,
+        ))
 
-        # Puntos + etiquetas
-        for i, row in forecast.reset_index(drop=True).iterrows():
-            pc = "#FF4444" if row["yhat"] > LIMITE_CORR else pred_color
-            ax.errorbar(row["ds"], row["yhat"],
-                        yerr=[[row["yhat"] - row["yhat_lower"]],
-                              [row["yhat_upper"] - row["yhat"]]],
-                        fmt="none", ecolor=pc, elinewidth=1,
-                        capsize=4, capthick=1, alpha=0.8, zorder=7)
-            ax.plot(row["ds"], row["yhat"], marker="D", markersize=8,
-                    color=pc, markeredgecolor="white",
-                    markeredgewidth=0.7, linestyle="none", zorder=8)
-            v_off = y_max * (0.07 if i % 2 == 0 else -0.12)
-            ax.annotate(
-                f"P{i+1}: {row['yhat']:.3f}\n{row['ds'].strftime('%b %Y')}",
-                xy=(row["ds"], row["yhat"]),
-                xytext=(0, 18 + v_off), textcoords="offset points",
-                ha="center", va="bottom", fontsize=7, color=pc,
-                bbox=dict(boxstyle="round,pad=0.3", fc="#131F13",
-                          ec=pc, lw=0.7, alpha=0.88),
-                arrowprops=dict(arrowstyle="-", color=pc, lw=0.7),
-                zorder=9,
+        # Línea puente último dato → predicciones
+        bx = [ultima.isoformat()] + fc_ds
+        by = [float(vel.iloc[-1])] + list(forecast["yhat"])
+        fig.add_trace(go.Scatter(
+            x=bx, y=by,
+            mode="lines",
+            line=dict(color=pred_color, width=1.6, dash="dash"),
+            opacity=0.75,
+            showlegend=False,
+            hoverinfo="skip",
+        ))
+
+        # Puntos de predicción + error bars + etiquetas
+        point_colors = ["#FF4444" if y >
+                        LIMITE_CORR else pred_color for y in forecast["yhat"]]
+        labels = [f"P{i+1}: {y:.3f}<br>{ds.strftime('%b %Y')}"
+                  for i, (y, ds) in enumerate(zip(forecast["yhat"], forecast["ds"]))]
+
+        fig.add_trace(go.Scatter(
+            x=fc_ds,
+            y=forecast["yhat"],
+            mode="markers+text",
+            marker=dict(
+                symbol="diamond",
+                size=10,
+                color=point_colors,
+                line=dict(color="white", width=0.7),
+            ),
+            text=[f"P{i+1}: {y:.3f}" for i, y in enumerate(forecast["yhat"])],
+            textposition="top center",
+            textfont=dict(size=8, color=point_colors),
+            error_y=dict(
+                type="data",
+                array=list(forecast["yhat_upper"] - forecast["yhat"]),
+                arrayminus=list(forecast["yhat"] - forecast["yhat_lower"]),
+                visible=True,
+                color=pred_color,
+                thickness=1,
+                width=5,
+            ),
+            name="Prophet",
+            customdata=labels,
+            hovertemplate="%{customdata}<extra>Prophet</extra>",
+        ))
+
+        # Anotación de alerta temprana
+        if alerta_prophet:
+            fig.add_annotation(
+                text="⚠ ALERTA TEMPRANA — Predicción > 2 mpy",
+                xref="paper", yref="paper",
+                x=0.5, y=0.97,
+                showarrow=False,
+                font=dict(color="#FF4444", size=9),
+                bgcolor="#2A0000",
+                bordercolor="#FF4444",
+                borderwidth=1,
+                opacity=0.9,
             )
 
-        if alerta_prophet:
-            ax.annotate("⚠ ALERTA TEMPRANA — Predicción > 2 mpy",
-                        xy=(0.5, 0.975), xycoords="axes fraction",
-                        ha="center", va="top", fontsize=9, color="#FF4444",
-                        bbox=dict(boxstyle="round,pad=0.4", fc="#2A0000",
-                                  ec="#FF4444", lw=0.9, alpha=0.9), zorder=10)
-
-    if prophet_status and "Calculando" not in prophet_status:
-        ax.text(0.99, 0.02, prophet_status, transform=ax.transAxes,
-                fontsize=6.5, color="#546E7A", ha="right", va="bottom", alpha=0.8)
-    elif "Calculando" in prophet_status:
-        ax.text(0.99, 0.02, "⟳ calculando predicción...",
-                transform=ax.transAxes, fontsize=7,
-                color="#546E7A", ha="right", va="bottom")
-
-    # ── Decoración ────────────────────────────────────────────────────────────
-    ax.set_title(f"LADO {lado} — Velocidad de Corrosión vs Tiempo",
-                 color=color_main, fontsize=11, pad=8)
-    ax.set_xlabel("Fecha de retiro", fontsize=9)
-    ax.set_ylabel("mpy", fontsize=9)
-    ax.set_ylim(0, y_max)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-    fig.autofmt_xdate(rotation=35, ha="right")
-    ax.grid(True, axis="y", alpha=0.3)
-    for sp in ax.spines.values():
-        sp.set_edgecolor("#1A3A1A")
-
-    handles, labels = ax.get_legend_handles_labels()
-    if handles:
-        ax.legend(handles, labels, fontsize=7, loc="upper left",
-                  facecolor="#131F13", edgecolor="#1A3A1A",
-                  labelcolor="#C8E6C9", framealpha=0.9)
+    # ── Estado Prophet en esquina inferior derecha ────────────────────────────
+    if prophet_status:
+        color_st = "#546E7A"
+        txt_st = "⟳ calculando predicción..." if "Calculando" in prophet_status else prophet_status
+        fig.add_annotation(
+            text=txt_st,
+            xref="paper", yref="paper",
+            x=0.99, y=0.02,
+            xanchor="right", yanchor="bottom",
+            showarrow=False,
+            font=dict(color=color_st, size=7),
+            opacity=0.8,
+        )
 
     return fig
 
 
-# ── Dependencias CSS del módulo para el <head> de app.py ─────────────────────
+def _fig_to_html(fig: go.Figure) -> str:
+    """Serializa la figura a HTML sin <html>/<head> y sin CDN embebido
+    (el CDN se carga una sola vez desde CORROSION_HEAD_DEPS)."""
+    return pio.to_html(
+        fig,
+        full_html=False,
+        include_plotlyjs=False,   # CDN ya cargado en <head>
+        config={
+            "displayModeBar": True,
+            "modeBarButtonsToRemove": ["select2d", "lasso2d"],
+            "displaylogo": False,
+            "responsive": True,
+        },
+    )
+
+
+# ── Dependencias CSS/JS del módulo para el <head> de app.py ──────────────────
 CORROSION_HEAD_DEPS = [
+    # ── Plotly.js desde CDN (carga única, compartida por ambas gráficas) ──
+    ui.tags.script(src="https://cdn.plot.ly/plotly-2.32.0.min.js"),
+
     ui.tags.style(base_styles()),
     ui.tags.style("""
 .selectize-control .selectize-input {
@@ -544,6 +611,14 @@ CORROSION_HEAD_DEPS = [
 
     # ── CSS responsive para móvil + JS sidebar toggle ─────────────────────
     ui.tags.style("""
+/* Contenedor de la gráfica Plotly — ocupa 100% del card */
+.plotly-chart-wrapper {
+    width: 100%;
+    min-height: 380px;
+}
+.plotly-chart-wrapper .js-plotly-plot,
+.plotly-chart-wrapper .plot-container { width: 100% !important; }
+
 /* ─── Botón hamburguesa ─────────────────────────────────────────── */
 #sidebar-toggle-btn {
     display: none;
@@ -572,12 +647,8 @@ CORROSION_HEAD_DEPS = [
 @media (max-width: 768px) {
     #sidebar-toggle-btn { display: flex; }
 
-    /* CAUSA RAIZ: quitar overflow:hidden del padre */
-    #corrosion-layout {
-        overflow: visible !important;
-    }
+    #corrosion-layout { overflow: visible !important; }
 
-    /* Sidebar fijo, fuera de pantalla con transform */
     #corrosion-sidebar {
         position: fixed !important;
         top: 0 !important; left: 0 !important;
@@ -589,10 +660,7 @@ CORROSION_HEAD_DEPS = [
         transition: transform 0.28s cubic-bezier(.4,0,.2,1) !important;
         box-shadow: 4px 0 24px rgba(0,0,0,.85) !important;
     }
-
-    #corrosion-sidebar.sb-open {
-        transform: translateX(0) !important;
-    }
+    #corrosion-sidebar.sb-open { transform: translateX(0) !important; }
 
     #corrosion-main {
         width: 100% !important;
@@ -608,7 +676,7 @@ CORROSION_HEAD_DEPS = [
         padding: 0 10px 20px !important;
     }
     #corrosion-header-info { display: none !important; }
-    .shiny-plot-output { height: 260px !important; }
+    .plotly-chart-wrapper { min-height: 260px !important; }
 }
 """),
     ui.tags.script("""
@@ -620,15 +688,13 @@ CORROSION_HEAD_DEPS = [
 
     function openSB() {
         var s=S(), o=O(), b=B(); if(!s) return;
-        _open=true;
-        s.classList.add('sb-open');
+        _open=true; s.classList.add('sb-open');
         if(o){ o.style.display='block'; }
         if(b) b.textContent='✕';
     }
     function closeSB() {
         var s=S(), o=O(), b=B(); if(!s) return;
-        _open=false;
-        s.classList.remove('sb-open');
+        _open=false; s.classList.remove('sb-open');
         if(o) o.style.display='none';
         if(b) b.textContent='☰';
     }
@@ -638,16 +704,18 @@ CORROSION_HEAD_DEPS = [
         if(o && e.target===o){ closeSB(); }
     }, true);
 })();
-"""),]
+"""),
+]
 
+
+# ═══════════════════════════════════════════════════════
+#  UI DEL MÓDULO
+# ═══════════════════════════════════════════════════════
 
 def corrosion_ui():
-    """Retorna la UI del dashboard de corrosión"""
     prophet_status = "Prophet OK" if PROPHET_OK else "Sin Prophet (pip install prophet)"
 
     return ui.div(
-
-        # Header
         ui.div(
             ui.div(
                 ui.div(
@@ -670,24 +738,21 @@ def corrosion_ui():
                 style=f"background: linear-gradient(90deg, #030A03 0%, #0A1A0A 60%, #030A03 100%); border-bottom: 2px solid {ACCENT}; padding: 14px 28px; display: flex; align-items: center; justify-content: space-between;"
             ),
 
-            # Botón hamburguesa (solo visible en móvil via CSS)
             ui.tags.button("☰", id="sidebar-toggle-btn",
                            title="Mostrar / ocultar filtros"),
-            # Overlay oscuro
             ui.tags.div(id="sidebar-overlay"),
 
-            # Main content
             ui.div(
                 # Sidebar
                 ui.div(
                     section_title("FILTROS", ACCENT),
                     label("Activo / Gerencia"),
-                    ui.input_selectize("activo", "", choices=[], multiple=False, options={
-                                       "placeholder": "Buscar activo...", "allowEmptyOption": True}),
+                    ui.input_selectize("activo", "", choices=[], multiple=False,
+                                       options={"placeholder": "Buscar activo...", "allowEmptyOption": True}),
                     ui.div(style="height: 12px;"),
                     label("SAP DDV / Ducto"),
-                    ui.input_selectize("ducto", "", choices=[], multiple=False, options={
-                                       "placeholder": "Buscar ducto...", "allowEmptyOption": True}),
+                    ui.input_selectize("ducto", "", choices=[], multiple=False,
+                                       options={"placeholder": "Buscar ducto...", "allowEmptyOption": True}),
                     ui.div(style="height: 12px;"),
                     label("Año de inicio"),
                     ui.input_select("year_from", "",
@@ -703,23 +768,22 @@ def corrosion_ui():
                     ui.div(
                         style=f"border-top: 1px solid {BORDER}; margin: 18px 0;"),
                     section_title("MONITOR N8N", RED_ALRT),
-                    # Estado webhook + botón TEST
                     ui.div(
                         ui.span(
                             "*", style=f"color: {GREEN}; margin-right: 6px; font-size: 11px;"),
-                        ui.span(
-                            "Webhook configurado", style=f"font-size: 10px; color: {GREEN}; font-family: {FONT_MONO};"),
+                        ui.span("Webhook configurado",
+                                style=f"font-size: 10px; color: {GREEN}; font-family: {FONT_MONO};"),
                         style="display: flex; align-items: center; margin-bottom: 6px;"
                     ),
                     ui.div(
                         ui.span(
                             "Limite: ", style=f"font-size: 9px; color: {TEXT_DIM}; font-family: {FONT_MONO};"),
-                        ui.span(
-                            f"{LIMITE_CORR} mpy", style=f"font-size: 11px; color: {RED_ALRT}; font-family: {FONT_MONO}; font-weight: 700;"),
+                        ui.span(f"{LIMITE_CORR} mpy",
+                                style=f"font-size: 11px; color: {RED_ALRT}; font-family: {FONT_MONO}; font-weight: 700;"),
                         ui.span(
                             "  Revision: ", style=f"font-size: 9px; color: {TEXT_DIM}; font-family: {FONT_MONO};"),
-                        ui.span(
-                            f"{POLL_SECONDS}s", style=f"font-size: 11px; color: {ACCENT}; font-family: {FONT_MONO};"),
+                        ui.span(f"{POLL_SECONDS}s",
+                                style=f"font-size: 11px; color: {ACCENT}; font-family: {FONT_MONO};"),
                         style="margin-bottom: 8px; display: flex; align-items: center; flex-wrap: wrap; gap: 2px;"
                     ),
                     ui.output_ui("corrosion_n8n_alertas"),
@@ -744,9 +808,15 @@ def corrosion_ui():
                         "CALCULAR PROPHET",
                         id="corrosion_prophet_btn",
                         onclick="Shiny.setInputValue('corrosion_prophet_run', Math.random());",
-                        style=f"width: 100%; padding: 8px; background: transparent; border: 1px solid {GREEN2}; color: {GREEN2}; font-family: {FONT_MONO}; font-size: 10px; letter-spacing: 2px; border-radius: 5px; cursor: pointer; margin-bottom: 4px;"
-                        if PROPHET_OK else
-                        f"width: 100%; padding: 8px; background: transparent; border: 1px solid {BORDER}; color: {TEXT_DIM}; font-family: {FONT_MONO}; font-size: 10px; letter-spacing: 2px; border-radius: 5px; cursor: not-allowed; margin-bottom: 4px;"
+                        style=(
+                            f"width: 100%; padding: 8px; background: transparent; border: 1px solid {GREEN2}; "
+                            f"color: {GREEN2}; font-family: {FONT_MONO}; font-size: 10px; letter-spacing: 2px; "
+                            f"border-radius: 5px; cursor: pointer; margin-bottom: 4px;"
+                            if PROPHET_OK else
+                            f"width: 100%; padding: 8px; background: transparent; border: 1px solid {BORDER}; "
+                            f"color: {TEXT_DIM}; font-family: {FONT_MONO}; font-size: 10px; letter-spacing: 2px; "
+                            f"border-radius: 5px; cursor: not-allowed; margin-bottom: 4px;"
+                        )
                     ),
                     ui.output_ui("corrosion_prophet_status"),
 
@@ -755,63 +825,70 @@ def corrosion_ui():
                     section_title("INFO DEL DUCTO", ACCENT),
                     ui.output_ui("corrosion_info"),
 
-                    id="corrosion-sidebar", style=f"width: 230px; min-width: 230px; background: #0F1A0F; border-right: 2px solid {BORDER}; padding: 18px 15px; overflow-y: auto; height: calc(100vh - 62px);"
+                    id="corrosion-sidebar",
+                    style=f"width: 230px; min-width: 230px; background: #0F1A0F; border-right: 2px solid {BORDER}; padding: 18px 15px; overflow-y: auto; height: calc(100vh - 62px);"
                 ),
 
                 # Main content
                 ui.div(
                     ui.div(
-                        kpi_card("*", "DUCTOS",        0),
-                        kpi_card("*", "REGISTROS",     1),
-                        kpi_card("^", "VEL MAX (mpy)", 2),
+                        kpi_card("*", "DUCTOS",         0),
+                        kpi_card("*", "REGISTROS",      1),
+                        kpi_card("^", "VEL MAX (mpy)",  2),
                         kpi_card("~", "VEL PROM (mpy)", 3),
-                        kpi_card("!", "> LIMITE",      4),
-                        kpi_card("*", "CONDICION",     5),
-                        id="corrosion-kpi-grid", style="display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; padding: 16px 18px 12px;"
+                        kpi_card("!", "> LIMITE",        4),
+                        kpi_card("*", "CONDICION",       5),
+                        id="corrosion-kpi-grid",
+                        style="display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; padding: 16px 18px 12px;"
                     ),
                     ui.output_ui("corrosion_banner"),
 
                     ui.div(
+                        # Card Lado A — usa output_ui (no output_plot)
                         ui.div(
                             ui.div(
                                 ui.span(
                                     "LADO A", style=f"font-size: 12px; font-weight: 700; color: {A_MAIN};"),
                                 ui.output_text("corrosion_tag_a"),
                             ),
-                            ui.output_plot("corrosion_graph_a",
-                                           height="380px"),
+                            ui.div(
+                                ui.output_ui("corrosion_graph_a"),
+                                class_="plotly-chart-wrapper",
+                            ),
                             style=f"background: {BG_CARD}; border: 1px solid {BORDER}; border-top: 3px solid {A_MAIN}; border-radius: 10px; padding: 14px 16px;"
                         ),
+                        # Card Lado B
                         ui.div(
                             ui.div(
                                 ui.span(
                                     "LADO B", style=f"font-size: 12px; font-weight: 700; color: {B_MAIN};"),
                                 ui.output_text("corrosion_tag_b"),
                             ),
-                            ui.output_plot("corrosion_graph_b",
-                                           height="380px"),
+                            ui.div(
+                                ui.output_ui("corrosion_graph_b"),
+                                class_="plotly-chart-wrapper",
+                            ),
                             style=f"background: {BG_CARD}; border: 1px solid {BORDER}; border-top: 3px solid {B_MAIN}; border-radius: 10px; padding: 14px 16px;"
                         ),
-                        id="corrosion-charts-grid", style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px; padding: 0 18px 20px;"
+                        id="corrosion-charts-grid",
+                        style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px; padding: 0 18px 20px;"
                     ),
-                    id="corrosion-main", style=f"flex: 1; overflow-y: auto; background: {BG_DARK};"
+                    id="corrosion-main",
+                    style=f"flex: 1; overflow-y: auto; background: {BG_DARK};"
                 ),
-                id="corrosion-layout", style="display: flex; height: calc(100vh - 62px); overflow: hidden;"
+                id="corrosion-layout",
+                style="display: flex; height: calc(100vh - 62px); overflow: hidden;"
             ),
             style="background: #0A1A0A; min-height: 100vh;"
-        ),
-        ui.tags.script(
-            f"setInterval(function() {{ Shiny.setInputValue('corrosion_interval', Math.random()); }}, {POLL_SECONDS * 1000});"
         )
     )
+
 
 # ═══════════════════════════════════════════════════════
 #  SERVER DEL MÓDULO
 # ═══════════════════════════════════════════════════════
 
-
 def corrosion_server(input, output, session):
-    """Registra los outputs del módulo de corrosión"""
 
     selected_data = reactive.Value({
         "activo": None, "ducto": None,
@@ -880,15 +957,16 @@ def corrosion_server(input, output, session):
     @render.text
     def kpi_val_0():
         data = selected_data.get()
-        return "1" if data["applied"] and data["ducto"] else str(_STATE["df"]["sap_ddv_ducto"].nunique() if not _STATE["df"].empty else 0)
+        return "1" if data["applied"] and data["ducto"] else str(
+            _STATE["df"]["sap_ddv_ducto"].nunique() if not _STATE["df"].empty else 0)
 
     @output
     @render.text
     def kpi_val_1():
         data = selected_data.get()
         if not data["applied"] or not data["ducto"]:
-            return f"{len(_STATE["df"]):,}"
-        return f"{len(_STATE["df"][_STATE["df"]['sap_ddv_ducto'] == data['ducto']]):,}"
+            return f"{len(_STATE['df']):,}"
+        return f"{len(_STATE['df'][_STATE['df']['sap_ddv_ducto'] == data['ducto']]):,}"
 
     @output
     @render.text
@@ -941,13 +1019,11 @@ def corrosion_server(input, output, session):
 
     @output
     @render.ui
-    @reactive.event(input.corrosion_interval)
     def corrosion_n8n_alertas():
+        reactive.invalidate_later(POLL_SECONDS)
         n = len(_alertas_emitidas)
         exc = int((_STATE["df"]["velocidad_de_corrosion_mpy"]
                   > LIMITE_CORR).sum()) if not _STATE["df"].empty else 0
-
-        # Construir log de últimas 6 entradas
         log_items = []
         for entry in reversed(_n8n_log[-6:]):
             color = GREEN if entry["ok"] else RED_ALRT
@@ -960,7 +1036,6 @@ def corrosion_server(input, output, session):
                     style="margin-bottom: 3px; line-height: 1.3;"
                 )
             )
-
         return ui.div(
             ui.div(
                 ui.span(f"Excedentes en datos: {exc}",
@@ -972,10 +1047,9 @@ def corrosion_server(input, output, session):
                         style=f"color: {ORANGE if n > 0 else TEXT_DIM}; font-size: 10px; font-family: {FONT_MONO};"),
                 style="margin-bottom: 8px;"
             ),
-            # Log de últimos envíos
             ui.div(
-                ui.div(
-                    "ULTIMO LOG N8N:", style=f"font-size: 8px; color: {TEXT_DIM}; font-family: {FONT_MONO}; margin-bottom: 4px; letter-spacing: 1px;"),
+                ui.div("ULTIMO LOG N8N:",
+                       style=f"font-size: 8px; color: {TEXT_DIM}; font-family: {FONT_MONO}; margin-bottom: 4px; letter-spacing: 1px;"),
                 *log_items if log_items else [
                     ui.div("Sin alertas enviadas aún",
                            style=f"font-size: 8px; color: {TEXT_DIM}; font-family: {FONT_MONO}; font-style: italic;")
@@ -1024,8 +1098,8 @@ def corrosion_server(input, output, session):
         if r is None:
             return ui.div()
         return ui.div(
-            ui.span(
-                f"* {data['ducto']}", style=f"font-weight: 700; color: {ACCENT}; font-family: {FONT_MONO}; font-size: 14px; margin-right: 14px;"),
+            ui.span(f"* {data['ducto']}",
+                    style=f"font-weight: 700; color: {ACCENT}; font-family: {FONT_MONO}; font-size: 14px; margin-right: 14px;"),
             ui.span(r.get('origen',  '—'),
                     style=f"color: {TEXT_DIM}; font-family: {FONT_MONO}; font-size: 11px;"),
             ui.span("  →  ",
@@ -1066,11 +1140,12 @@ def corrosion_server(input, output, session):
         return str(sub.iloc[0]) if not sub.empty else ""
 
     def _get_dff(data, lado):
-        """Filtra DF por ducto, lado y rango de años."""
         if not data["applied"] or not data["ducto"]:
             return pd.DataFrame()
-        dff = _STATE["df"][(_STATE["df"]["sap_ddv_ducto"] == data["ducto"]) & (
-            _STATE["df"]["lado"] == lado)].copy()
+        dff = _STATE["df"][
+            (_STATE["df"]["sap_ddv_ducto"] == data["ducto"]) &
+            (_STATE["df"]["lado"] == lado)
+        ].copy()
         if data["year_from"]:
             dff = dff[dff["fecha_retiro"].dt.year >= int(data["year_from"])]
         if data["year_to"]:
@@ -1078,21 +1153,17 @@ def corrosion_server(input, output, session):
         return dff
 
     def _get_prophet_result(dff, data, lado):
-        """Obtiene (forecast, alerta, status) desde cache sin bloquear."""
         if dff.empty:
             return None, False, ""
         key = (data["ducto"], lado, data.get("year_from"), data.get("year_to"))
         return get_prophet(key, dff.copy(), periodos=3)
 
-    # Flag reactivo: True solo cuando el usuario presionó "CALCULAR PROPHET"
-    # Se resetea al cambiar ducto/filtros para evitar calcular con datos viejos
     _prophet_requested = reactive.Value(False)
 
     @reactive.Effect
     @reactive.event(input.corrosion_apply, input.corrosion_clear)
     def _reset_prophet_flag():
         _prophet_requested.set(False)
-        # Limpiar cache prophet de la selección anterior
         data = selected_data.get()
         if data.get("ducto"):
             for lado in ("A", "B"):
@@ -1109,12 +1180,9 @@ def corrosion_server(input, output, session):
     @output
     @render.ui
     def corrosion_prophet_status():
-        """Estado de Prophet debajo del botón."""
         if not _prophet_requested.get():
-            return ui.span(
-                "Sin predicción activa",
-                style=f"font-size: 9px; color: {TEXT_DIM}; font-family: {FONT_MONO};"
-            )
+            return ui.span("Sin predicción activa",
+                           style=f"font-size: 9px; color: {TEXT_DIM}; font-family: {FONT_MONO};")
         data = selected_data.get()
         if not data.get("applied") or not data.get("ducto"):
             return ui.span("")
@@ -1135,43 +1203,47 @@ def corrosion_server(input, output, session):
             style=f"font-size: 9px; color: {GREEN if done else ORANGE}; font-family: {FONT_MONO};"
         )
 
-    def _make_graph(lado: str):
-        """Genera figura para el lado indicado. Sin cache de figura — siempre fresca."""
+    def _make_graph_html(lado: str):
+        """Genera HTML de la figura Plotly para el lado indicado."""
         data = selected_data.get()
         if not data.get("applied") or not data.get("ducto"):
-            return None
+            return ui.div(
+                "Selecciona un ducto y presiona APLICAR",
+                style=f"color: {TEXT_DIM}; font-size: 11px; font-family: {FONT_MONO}; padding: 40px; text-align: center;"
+            )
         dff = _get_dff(data, lado)
         if dff.empty:
-            return None
+            return ui.div(
+                f"Sin datos para Lado {lado}",
+                style=f"color: {TEXT_DIM}; font-size: 11px; font-family: {FONT_MONO}; padding: 40px; text-align: center;"
+            )
         fc, alerta, status = (None, False, "")
         if _prophet_requested.get() and PROPHET_OK:
             fc, alerta, status = _get_prophet_result(dff, data, lado)
-        # Crear figura fresca — plt.close se llama dentro de build_chart (no)
-        # Shiny llama savefig() y cierra por su cuenta; build_chart retorna Figure limpia
-        fig = build_chart(dff, lado,
-                          forecast=fc, alerta_prophet=alerta, prophet_status=status)
-        return fig
+        # uirevision_key: cambia solo cuando el usuario aplica nuevos filtros
+        uirev = f"{data['ducto']}-{data.get('year_from')}-{data.get('year_to')}-{lado}"
+        fig = build_chart(dff, lado, forecast=fc, alerta_prophet=alerta,
+                          prophet_status=status, uirevision_key=uirev)
+        return ui.HTML(_fig_to_html(fig))
 
+    # ── Outputs de gráficas — render.ui en lugar de render.plot ─────────────
     @output
-    @render.plot
+    @render.ui
     def corrosion_graph_a():
-        # Reactividad natural: re-ejecuta cuando selected_data o _prophet_requested cambian.
-        # El interval tick también provoca re-render para recoger Prophet cuando termina.
-        input.corrosion_interval()
-        return _make_graph("A")
+        # re-render periódico para Prophet async
+        reactive.invalidate_later(POLL_SECONDS)
+        return _make_graph_html("A")
 
     @output
-    @render.plot
+    @render.ui
     def corrosion_graph_b():
-        input.corrosion_interval()
-        return _make_graph("B")
+        reactive.invalidate_later(POLL_SECONDS)
+        return _make_graph_html("B")
 
 
 # ═══════════════════════════════════════════════════════
-#  ARRANQUE DEL MONITOR — se ejecuta al importar el módulo
+#  ARRANQUE DEL MONITOR
 # ═══════════════════════════════════════════════════════
-# El thread es daemon=True: muere automáticamente cuando el proceso principal termina.
-# Se lanza aquí para que funcione tanto con app.py como en ejecución directa.
 if not _STATE["df"].empty:
     _t_monitor = threading.Thread(
         target=_monitor_archivo, daemon=True, name="monitor-corrosion")
@@ -1180,10 +1252,6 @@ if not _STATE["df"].empty:
         f"  [Monitor] Thread lanzado (daemon) — PID monitor: {_t_monitor.ident}", flush=True)
 else:
     print("  [Monitor] DataFrame vacío — monitor NO iniciado", flush=True)
-
-# ═══════════════════════════════════════════════════════
-#  LINKS DE ACCESO — se imprimen al arrancar el módulo
-# ═══════════════════════════════════════════════════════
 
 
 def _print_access_links(port: int = 8000):
@@ -1204,11 +1272,11 @@ def _print_access_links(port: int = 8000):
 
     def _ip_priority(ip):
         if ip.startswith("192.168."):
-            return 0   # WiFi doméstica — primero
+            return 0
         if ip.startswith("10."):
-            return 1   # LAN corporativa
+            return 1
         if ip.startswith("172.16.") or ip.startswith("172.17."):
-            return 9  # virtuales — al fondo
+            return 9
         return 5
 
     all_ips.sort(key=_ip_priority)
@@ -1227,6 +1295,7 @@ def _print_access_links(port: int = 8000):
 
 
 _print_access_links(port=8000)
+
 
 # ═══════════════════════════════════════════════════════
 #  PARA EJECUCIÓN INDEPENDIENTE
