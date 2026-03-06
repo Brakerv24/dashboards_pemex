@@ -2,6 +2,7 @@
 
 from shiny import App, ui, reactive, render
 from modules.corrosion import corrosion_ui, corrosion_server, CORROSION_HEAD_DEPS
+from modules.inyeccion_inhibidor import suministro_inhibidor_ui, suministro_inhibidor_server
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -98,8 +99,8 @@ def app_ui():
         # ── Tabs de navegación ───────────────────────────────────────────────
         ui.navset_tab(
             ui.nav_panel("🔧 Protección Interior", corrosion_ui()),
-            ui.nav_panel("⚡ Producción",           ui.div(
-                "Dashboard de Producción")),
+            ui.nav_panel("⚡ Suministro de inhibidor",
+                         suministro_inhibidor_ui()),
             ui.nav_panel("📊 Ventas",               ui.div(
                 "Dashboard de Ventas")),
             ui.nav_menu(
@@ -119,7 +120,8 @@ def app_ui():
 
 def server(input, output, session):
     """Inicializa todos los servers de los módulos"""
-    corrosion_server(input, output, session)
+    corrosion_server(input, output, session),
+    suministro_inhibidor_server(input, output, session)
     # produccion_server(input, output, session)
 
 
